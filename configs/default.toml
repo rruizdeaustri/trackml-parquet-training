@@ -1,0 +1,50 @@
+[data]
+data_dir = "/path/to/preprocessed_tensors"
+train_file = "train.pt"
+val_file = "val.pt"
+test_file = "test.pt"
+test_helperfile = "test_helper.pt"
+test_truthfile = "test_truth.csv"
+num_classes = 2
+dataloader_num_workers = 4
+
+[model]
+inputfeature_dim = 3
+num_heads = 4
+embed_dim = 128
+num_layers = 4
+dim_feedforward = 512
+dropout = 0.1
+use_flash_attention = true
+checkpoint_path = ""
+
+[training]
+batch_size = 1
+shuffle = true
+total_epochs = 50
+start_from_scratch = true
+checkpoint_path = ""
+early_stopping = 10
+
+[training.scheduler]
+initial_lr = 1e-4
+mode = "min"
+factor = 0.5
+patience = 5
+verbose = true
+
+[logging]
+level = "INFO"
+epoch_log_interval = 1
+model_save_interval = 10
+
+[output]
+base_dir = "outputs"
+run_name = "tracking_run"
+
+[wandb]
+enabled = false
+project = "trackml"
+entity = ""
+name = "tracking_run"
+watch_interval = 100

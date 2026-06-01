@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+.env
+.venv/
+
+runs/
+outputs/
+checkpoints/
+wandb/
+
+*.pt
+*.pth
+*.ckpt
+
+*.csv
+*.h5
+*.hdf5
+*.tgz
+*.tar.gz
+
+# Ignore all parquet files by default
+*.parquet
+
+# But keep tiny example parquet files
+!data_examples/
+!data_examples/*.parquet

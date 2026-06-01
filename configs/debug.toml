@@ -1,0 +1,74 @@
+[data]
+format = "parquet"
+parquet_dir = "/lustre/ific.uv.es/prj/gl/som.mosayco/rruiz/projects/tracking/data/batches_parquet_binned"
+parquet_glob = "batch_*.parquet"
+train_fraction = 0.8
+val_fraction = 0.1
+split_seed = 12345
+
+# Input features passed to the transformer.
+feature_columns = ["x", "y", "z"]
+inputfeature_dim = 3
+
+# Original-style binned track-class labels.
+# class_id should already exist in the binned parquet files.
+label_mode = "class_id"
+label_column = "class_id"
+
+# 30 phi bins * 30 theta bins * 3 p bins * 2 q bins = 5400
+# plus 0 reserved for padding.
+num_classes = 5401
+
+# Use 20000 for a first test. Remove or set to null later for full events.
+max_hits = 512
+sort_by = "none"
+dataloader_num_workers = 4
+
+[model]
+inputfeature_dim = 3
+num_heads = 4
+embed_dim = 128
+num_layers = 4
+dim_feedforward = 512
+dropout = 0.1
+use_flash_attention = true
+checkpoint_path = ""
+
+[training]
+batch_size = 1
+shuffle = true
+total_epochs = 50
+start_from_scratch = true
+checkpoint_path = ""
+
+[training.scheduler]
+initial_lr = 1e-4
+mode = "min"
+factor = 0.5
+patience = 5
+warmup_epochs = 0
+verbose = true
+
+[training.early_stopping]
+patience = 10
+verbose = true
+
+[evaluation]
+run_test = false
+
+[logging]
+level = "INFO"
+epoch_log_interval = 1
+model_save_interval = 10
+
+[output]
+base_path = "/lustre/ific.uv.es/prj/gl/som.mosayco/rruiz/projects/tracking/runs"
+base_dir = "outputs"
+run_name = "tracking_parquet_run"
+
+[wandb]
+enabled = false
+project = "trackml"
+entity = ""
+name = "debug"
+watch_interval = 100

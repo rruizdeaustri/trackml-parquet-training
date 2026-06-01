@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracking-train"
+version = "0.1.0"
+description = "Compact TrackML tracking training package"
+requires-python = ">=3.9"
+dependencies = [
+  "torch",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "toml",
+  "matplotlib",
+  "wandb",
+  "psutil",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
