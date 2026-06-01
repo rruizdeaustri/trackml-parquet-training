@@ -1,0 +1,42 @@
+[data]
+format = "parquet"
+parquet_dir = "data_examples"
+parquet_glob = "*.parquet"
+feature_columns = ["x", "y", "z"]
+inputfeature_dim = 3
+label_mode = "class_id"
+label_column = "class_id"
+num_classes = 5401
+max_hits = 32
+sort_by = "none"
+dataloader_num_workers = 0
+
+[model]
+inputfeature_dim = 3
+num_heads = 2
+embed_dim = 16
+num_layers = 1
+dim_feedforward = 32
+dropout = 0.0
+use_flash_attention = false
+
+[training]
+batch_size = 2
+shuffle = false
+start_from_scratch = true
+
+[training.scheduler]
+initial_lr = 1e-4
+mode = "min"
+factor = 0.5
+patience = 1
+
+[logging]
+level = "INFO"
+
+[output]
+base_dir = "outputs"
+run_name = "tiny_debug"
+
+[wandb]
+enabled = false
