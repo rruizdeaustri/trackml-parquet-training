@@ -131,6 +131,7 @@ class TransformerClassifier(nn.Module):
         self.embedding = nn.Linear(inputfeature_dim, embed_dim)
 #        self.pos_enc_layerid = nn.Embedding(13, embed_dim)
 #        self.pos_enc_moduleid = nn.Embedding(3192, embed_dim)
+        self.use_flash_attention = use_flash_attention
         if use_flash_attention:
             encoder_layer = CustomTransformerEncoderLayer(
                 embed_dim,
@@ -139,6 +140,11 @@ class TransformerClassifier(nn.Module):
                 dropout=dropout,
                 batch_first=True
                 )
+            self.encoder = CustomTransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
         else:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -149,11 +155,11 @@ class TransformerClassifier(nn.Module):
                 # as (batch, seq, feature). Default: "False" (seq, batch, feature).
                 batch_first=True,
             )
-        self.encoder = CustomTransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            enable_nested_tensor=False,
-        )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
         self.classifier = nn.Linear(embed_dim, num_classes)
         self.num_classes = num_classes
 
@@ -181,12 +187,15 @@ class TransformerClassifier(nn.Module):
  #       pos_emb = layer_enc + module_enc
  #       x = x + pos_emb
 
-        # Creating mask for flex attention
-        B, S = input.size(0), input.size(1)
-        key = (batch_name, B, S)
-        mask_gpu = self.build_or_reuse_gpu_mask(key, flex_padding_mask, B, S)
+        if self.use_flash_attention:
+            # Creating mask for flex attention
+            B, S = input.size(0), input.size(1)
+            key = (batch_name, B, S)
+            mask_gpu = self.build_or_reuse_gpu_mask(key, flex_padding_mask, B, S)
+            memory = self.encoder(src=x, flex_mask=mask_gpu)
+        else:
+            memory = self.encoder(src=x)
 
-        memory = self.encoder(src=x, flex_mask=mask_gpu)
         out = self.classifier(memory)
 
         return out
