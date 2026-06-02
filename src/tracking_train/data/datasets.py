@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 # Compatibility for old torch pickles created with newer numpy layouts.
@@ -104,7 +103,11 @@ def load_dataloader(config, device=None, mode="all"):
                 pin_memory=torch.cuda.is_available(),
             )
             loaders["test_helper"] = DataLoader(
-                ParquetScoringHelperDataset(test_files),
+                ParquetScoringHelperDataset(
+                    test_files,
+                    max_hits=data_cfg.get("max_hits"),
+                    sort_by=data_cfg.get("sort_by", "none"),
+                ),
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
@@ -151,9 +154,42 @@ def load_truths(config):
     data_cfg = config["data"]
     if _cfg_get(data_cfg, "format", "pt") == "parquet":
         truth_file = _cfg_get(data_cfg, "test_truthfile", "")
-        if not truth_file:
+        if truth_file:
+            return pd.read_csv(truth_file)
+
+        parquet_dir = data_cfg["parquet_dir"]
+        pattern = _cfg_get(data_cfg, "parquet_glob", "*.parquet")
+        files = sorted(glob.glob(os.path.join(parquet_dir, pattern)))
+        _, _, test_files = _split_files(
+            files,
+            train_fraction=_cfg_get(data_cfg, "train_fraction", 0.8),
+            val_fraction=_cfg_get(data_cfg, "val_fraction", 0.1),
+            seed=_cfg_get(data_cfg, "split_seed", 12345),
+        )
+        truth_frames = []
+        for file_path in test_files:
+            df = pd.read_parquet(file_path)
+            if (
+                _cfg_get(data_cfg, "sort_by", "none") != "none"
+                and data_cfg["sort_by"] in df.columns
+            ):
+                df = df.sort_values(data_cfg["sort_by"], kind="mergesort")
+            max_hits = _cfg_get(data_cfg, "max_hits")
+            if max_hits is not None and len(df) > max_hits:
+                df = df.iloc[:max_hits]
+            required = ["hit_id", "particle_id", "weight", "event_id"]
+            missing = [column for column in required if column not in df.columns]
+            if missing:
+                logging.warning(
+                    "Skipping inferred Parquet truths for %s because columns are missing: %s",
+                    file_path,
+                    missing,
+                )
+                return None
+            truth_frames.append(df[required])
+        if not truth_frames:
             return None
-        return pd.read_csv(truth_file)
+        return pd.concat(truth_frames, ignore_index=True)
     return pd.read_csv(os.path.join(data_cfg["data_dir"], data_cfg["test_truthfile"]))
 
 
@@ -218,8 +254,18 @@ def collate_fn(batch):
 
 def collate_fn_scoringhelper(batch):
     dat1, dat2 = zip(*batch)
-    dat1_padded = pad_sequence(dat1, batch_first=True, padding_value=PAD_TOKEN)
-    dat2_padded = pad_sequence(dat2, batch_first=True, padding_value=PAD_TOKEN)
+    max_seq_len = max(x.size(0) for x in dat1)
+    padded_len = round_up_to_multiple(max_seq_len)
+
+    def pad_to_len(tensors, target_len):
+        padded = []
+        for tensor in tensors:
+            pad_len = target_len - tensor.size(0)
+            padded.append(F.pad(tensor, (0, pad_len), value=PAD_TOKEN))
+        return torch.stack(padded)
+
+    dat1_padded = pad_to_len(dat1, padded_len)
+    dat2_padded = pad_to_len(dat2, padded_len)
     return dat1_padded, dat2_padded
 
 
@@ -313,14 +359,20 @@ class ParquetEventDataset(Dataset):
 
 
 class ParquetScoringHelperDataset(Dataset):
-    def __init__(self, parquet_files):
+    def __init__(self, parquet_files, max_hits=None, sort_by="none"):
         self.files = list(parquet_files)
+        self.max_hits = max_hits
+        self.sort_by = sort_by
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         df = pd.read_parquet(self.files[idx])
+        if self.sort_by and self.sort_by != "none" and self.sort_by in df.columns:
+            df = df.sort_values(self.sort_by, kind="mergesort")
+        if self.max_hits is not None and len(df) > self.max_hits:
+            df = df.iloc[: self.max_hits]
         if "hit_id" in df.columns:
             hit_ids = df["hit_id"].to_numpy(np.int64)
         else:
