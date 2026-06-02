@@ -13,6 +13,7 @@ dataloader_num_workers = 0
 
 [model]
 inputfeature_dim = 3
+num_classes = 5401
 num_heads = 2
 embed_dim = 16
 num_layers = 1
@@ -25,6 +26,7 @@ batch_size = 2
 shuffle = false
 start_from_scratch = true
 total_epochs = 1
+checkpoint_path = ""
 
 [training.scheduler]
 initial_lr = 1e-4
@@ -50,3 +52,7 @@ run_name = "tiny_debug"
 
 [wandb]
 enabled = false
+project = "trackml"
+entity = ""
+name = "tiny_debug"
+watch_interval = 100
