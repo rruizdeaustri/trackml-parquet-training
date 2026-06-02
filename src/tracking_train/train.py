@@ -32,6 +32,223 @@ torch.set_default_dtype(torch.float32)
 # torch.cuda.manual_seed(42)
 # np.random.seed(42)
 
+
+
+class ConfigError(ValueError):
+    """Raised when a TOML training configuration is missing or inconsistent."""
+
+
+def _toml_path(path):
+    if len(path) == 1:
+        return f"[{path[0]}]"
+    return f"[{'.'.join(path[:-1])}].{path[-1]}"
+
+
+def _get_config_value(config, path, errors, expected_type=None):
+    node = config
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            errors.append(f"Missing required config key: {_toml_path(path)}")
+            return None
+        node = node[part]
+
+    if expected_type is not None and not isinstance(node, expected_type):
+        type_name = (
+            expected_type.__name__
+            if isinstance(expected_type, type)
+            else " or ".join(t.__name__ for t in expected_type)
+        )
+        errors.append(
+            f"Invalid config key {_toml_path(path)}: expected {type_name}, "
+            f"got {type(node).__name__}"
+        )
+    return node
+
+
+def _require_positive_int(config, path, errors):
+    value = _get_config_value(config, path, errors, int)
+    if value is not None and (isinstance(value, bool) or value <= 0):
+        errors.append(f"Invalid config key {_toml_path(path)}: expected a positive integer")
+    return value
+
+
+def _require_nonnegative_int(config, path, errors):
+    value = _get_config_value(config, path, errors, int)
+    if value is not None and (isinstance(value, bool) or value < 0):
+        errors.append(f"Invalid config key {_toml_path(path)}: expected a non-negative integer")
+    return value
+
+
+def _require_positive_number(config, path, errors):
+    value = _get_config_value(config, path, errors, (int, float))
+    if value is not None and (isinstance(value, bool) or value <= 0):
+        errors.append(f"Invalid config key {_toml_path(path)}: expected a positive number")
+    return value
+
+
+def _require_bool(config, path, errors):
+    value = _get_config_value(config, path, errors, bool)
+    return value
+
+
+def _require_nonempty_string(config, path, errors):
+    value = _get_config_value(config, path, errors, str)
+    if value is not None and not value:
+        errors.append(f"Invalid config key {_toml_path(path)}: expected a non-empty string")
+    return value
+
+
+def validate_config(config):
+    """Validate training config before filesystem setup, data loading, or model creation.
+
+    Raises
+    ------
+    ConfigError
+        If required TOML keys are missing or internally inconsistent.
+    """
+    errors = []
+
+    for section in ("data", "model", "training", "logging", "output", "wandb"):
+        _get_config_value(config, (section,), errors, dict)
+
+    data_format = config.get("data", {}).get("format", "pt")
+    if data_format not in {"pt", "parquet"}:
+        errors.append(
+            "Invalid config key [data].format: expected 'pt' or 'parquet'"
+        )
+
+    _require_positive_int(config, ("data", "num_classes"), errors)
+    data_input_dim = None
+
+    if data_format == "parquet":
+        feature_columns = _get_config_value(config, ("data", "feature_columns"), errors, list)
+        data_input_dim = _require_positive_int(config, ("data", "inputfeature_dim"), errors)
+
+        if feature_columns is not None:
+            if not feature_columns or not all(isinstance(col, str) and col for col in feature_columns):
+                errors.append(
+                    "Invalid config key [data].feature_columns: expected a non-empty list of strings"
+                )
+            elif data_input_dim is not None and len(feature_columns) != data_input_dim:
+                errors.append(
+                    "Inconsistent config: [data].inputfeature_dim must match "
+                    "len([data].feature_columns)"
+                )
+
+        _require_nonempty_string(config, ("data", "parquet_dir"), errors)
+        _require_nonempty_string(config, ("data", "parquet_glob"), errors)
+        label_mode = _require_nonempty_string(config, ("data", "label_mode"), errors)
+        if label_mode not in {None, "signal_vs_noise", "high_pt_signal_vs_rest", "class_id"}:
+            errors.append(
+                "Invalid config key [data].label_mode: expected one of "
+                "'signal_vs_noise', 'high_pt_signal_vs_rest', or 'class_id'"
+            )
+        if label_mode == "class_id":
+            _require_nonempty_string(config, ("data", "label_column"), errors)
+
+        max_hits = config.get("data", {}).get("max_hits")
+        if max_hits is not None and (not isinstance(max_hits, int) or isinstance(max_hits, bool) or max_hits <= 0):
+            errors.append(
+                "Invalid config key [data].max_hits: expected null or a positive integer"
+            )
+
+        for fraction_key in ("train_fraction", "val_fraction"):
+            if fraction_key in config.get("data", {}):
+                value = config["data"][fraction_key]
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+                    errors.append(
+                        f"Invalid config key [data].{fraction_key}: expected a number in [0, 1]"
+                    )
+        train_fraction = config.get("data", {}).get("train_fraction", 0.8)
+        val_fraction = config.get("data", {}).get("val_fraction", 0.1)
+        if isinstance(train_fraction, (int, float)) and isinstance(val_fraction, (int, float)):
+            if train_fraction + val_fraction > 1:
+                errors.append(
+                    "Inconsistent config: [data].train_fraction + [data].val_fraction must be <= 1"
+                )
+    else:
+        _require_nonempty_string(config, ("data", "data_dir"), errors)
+        _require_nonempty_string(config, ("data", "train_file"), errors)
+        _require_nonempty_string(config, ("data", "val_file"), errors)
+        _require_nonempty_string(config, ("data", "test_file"), errors)
+        _require_nonempty_string(config, ("data", "test_helperfile"), errors)
+
+    dataloader_workers = config.get("data", {}).get("dataloader_num_workers", 0)
+    if not isinstance(dataloader_workers, int) or isinstance(dataloader_workers, bool) or dataloader_workers < 0:
+        errors.append(
+            "Invalid config key [data].dataloader_num_workers: expected a non-negative integer"
+        )
+
+    model_input_dim = _require_positive_int(config, ("model", "inputfeature_dim"), errors)
+    if data_input_dim is not None and model_input_dim is not None and data_input_dim != model_input_dim:
+        errors.append(
+            "Inconsistent config: [model].inputfeature_dim must match [data].inputfeature_dim"
+        )
+    num_heads = _require_positive_int(config, ("model", "num_heads"), errors)
+    embed_dim = _require_positive_int(config, ("model", "embed_dim"), errors)
+    _require_positive_int(config, ("model", "num_layers"), errors)
+    _require_positive_int(config, ("model", "dim_feedforward"), errors)
+    dropout = _get_config_value(config, ("model", "dropout"), errors, (int, float))
+    _require_bool(config, ("model", "use_flash_attention"), errors)
+    if embed_dim is not None and num_heads is not None and embed_dim % num_heads != 0:
+        errors.append(
+            "Inconsistent config: [model].embed_dim must be divisible by [model].num_heads"
+        )
+    if dropout is not None and (isinstance(dropout, bool) or not 0 <= dropout < 1):
+        errors.append(
+            "Invalid config key [model].dropout: expected a number in [0, 1)"
+        )
+
+    _require_positive_int(config, ("training", "batch_size"), errors)
+    _require_bool(config, ("training", "shuffle"), errors)
+    _require_positive_int(config, ("training", "total_epochs"), errors)
+    start_from_scratch = _require_bool(config, ("training", "start_from_scratch"), errors)
+    if start_from_scratch is False and not config.get("training", {}).get("checkpoint_path"):
+        errors.append(
+            "Inconsistent config: [training].checkpoint_path is required when "
+            "[training].start_from_scratch is false"
+        )
+
+    _get_config_value(config, ("training", "scheduler"), errors, dict)
+    _require_positive_number(config, ("training", "scheduler", "initial_lr"), errors)
+    scheduler_mode = _require_nonempty_string(config, ("training", "scheduler", "mode"), errors)
+    if scheduler_mode not in {None, "min", "max"}:
+        errors.append("Invalid config key [training.scheduler].mode: expected 'min' or 'max'")
+    scheduler_factor = _get_config_value(config, ("training", "scheduler", "factor"), errors, (int, float))
+    if scheduler_factor is not None and (isinstance(scheduler_factor, bool) or not 0 < scheduler_factor < 1):
+        errors.append(
+            "Invalid config key [training.scheduler].factor: expected a number in (0, 1)"
+        )
+    _require_nonnegative_int(config, ("training", "scheduler", "patience"), errors)
+    _require_bool(config, ("training", "scheduler", "verbose"), errors)
+    warmup_epochs = _require_nonnegative_int(config, ("training", "scheduler", "warmup_epochs"), errors)
+    if warmup_epochs and "target_lr" not in config.get("training", {}).get("scheduler", {}):
+        errors.append(
+            "Missing required config key: [training.scheduler].target_lr when "
+            "[training.scheduler].warmup_epochs is greater than 0"
+        )
+    elif "target_lr" in config.get("training", {}).get("scheduler", {}):
+        target_lr = config["training"]["scheduler"]["target_lr"]
+        if not isinstance(target_lr, (int, float)) or isinstance(target_lr, bool) or target_lr <= 0:
+            errors.append(
+                "Invalid config key [training.scheduler].target_lr: expected a positive number"
+            )
+
+    _get_config_value(config, ("training", "early_stopping"), errors, dict)
+    _require_positive_int(config, ("training", "early_stopping", "patience"), errors)
+    _require_bool(config, ("training", "early_stopping", "verbose"), errors)
+
+    _require_nonempty_string(config, ("logging", "level"), errors)
+    _require_positive_int(config, ("logging", "epoch_log_interval"), errors)
+    _require_positive_int(config, ("logging", "model_save_interval"), errors)
+    _require_nonempty_string(config, ("output", "base_path"), errors)
+    _require_bool(config, ("wandb", "enabled"), errors)
+
+    if errors:
+        raise ConfigError("Invalid training config:\n- " + "\n- ".join(errors))
+    return config
+
+
 class DummyWandbLogger:
     """No-op logger used when WandB is disabled."""
 
@@ -99,7 +316,7 @@ def load_config(config_path):
     """
     with open(config_path, "r") as config_file:
         config = toml.load(config_file)
-    return config
+    return validate_config(config)
 
 
 def setup_logging(config, output_dir):
