@@ -365,5 +365,9 @@ class MetricsCalculator:
             np.sum(self.class_total_counts > 0) - 1
         )  # Excluding padding class
 
+        if total_classes == 0:
+            return 0.0
+
         epoch_score = 100 * successful_classes / total_classes
+        
         return epoch_score
