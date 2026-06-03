@@ -1,0 +1,63 @@
+# Tiny CPU-safe Optuna search space for smoke tests.
+# Use with: python scripts/optuna_study.py configs/tiny_debug.toml --optuna-config configs/optuna_tiny.toml
+
+[fixed.data]
+max_hits = 16
+
+[fixed.model]
+use_flash_attention = false
+
+[fixed.training]
+batch_size = 2
+total_epochs = 1
+
+[fixed.training.scheduler]
+verbose = false
+
+[fixed.evaluation]
+run_test = false
+
+[search.model.embed_dim]
+type = "categorical"
+choices = [16, 32]
+
+[search.model.num_heads]
+type = "categorical"
+choices = [1, 2, 4]
+
+[search.model.num_layers]
+type = "int"
+low = 1
+high = 1
+
+[search.model.dim_feedforward]
+type = "categorical"
+choices = [32, 64]
+
+[search.model.dropout]
+type = "float"
+low = 0.0
+high = 0.1
+
+[search.training.weight_decay]
+type = "log_float"
+low = 1e-6
+high = 1e-3
+
+[search.training.scheduler.initial_lr]
+type = "log_float"
+low = 1e-5
+high = 1e-3
+
+[search.training.scheduler.factor]
+type = "float"
+low = 0.4
+high = 0.8
+
+[search.training.scheduler.patience]
+type = "int"
+low = 1
+high = 1
+
+[constraints]
+embed_dim_divisible_by_num_heads = true

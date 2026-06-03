@@ -1,0 +1,64 @@
+# Larger Optuna search space for real TrackML studies.
+# Keep this separate from the base training config, e.g.:
+# python scripts/optuna_study.py configs/parquet.toml /path/to/study --optuna-config configs/optuna_trackml.toml --n-trials 50
+
+[fixed.training]
+start_from_scratch = true
+total_epochs = 50
+
+[fixed.training.scheduler]
+verbose = true
+
+[fixed.evaluation]
+run_test = false
+
+[search.data.max_hits]
+type = "categorical"
+# Increase these values as memory allows; remove this search entry from a copy to use the base config value.
+choices = [20000, 50000, 100000]
+
+[search.model.embed_dim]
+type = "categorical"
+choices = [64, 128, 256]
+
+[search.model.num_heads]
+type = "categorical"
+# The study script filters these choices per trial so only divisors of embed_dim are suggested.
+choices = [2, 4, 8]
+
+[search.model.num_layers]
+type = "int"
+low = 2
+high = 6
+
+[search.model.dim_feedforward]
+type = "categorical"
+choices = [256, 512, 1024]
+
+[search.model.dropout]
+type = "float"
+low = 0.0
+high = 0.3
+
+[search.training.weight_decay]
+type = "log_float"
+low = 1e-6
+high = 1e-2
+
+[search.training.scheduler.initial_lr]
+type = "log_float"
+low = 1e-5
+high = 3e-4
+
+[search.training.scheduler.factor]
+type = "float"
+low = 0.3
+high = 0.8
+
+[search.training.scheduler.patience]
+type = "int"
+low = 2
+high = 8
+
+[constraints]
+embed_dim_divisible_by_num_heads = true

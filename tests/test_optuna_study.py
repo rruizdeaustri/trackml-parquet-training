@@ -70,7 +70,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.optuna_study import run_study
+from scripts.optuna_study import run_study, suggest_overrides
 
 
 def _write_tiny_config(tmp_path):
@@ -93,9 +93,11 @@ def _write_tiny_config(tmp_path):
     return config_path
 
 
-def test_optuna_study_runs_two_tiny_cpu_trials_without_test_split(tmp_path):
+def test_optuna_study_runs_two_tiny_cpu_trials_from_toml_without_cuda(tmp_path):
     config_path = _write_tiny_config(tmp_path)
     study_dir = tmp_path / "runs" / "optuna_test"
+
+    optuna_config_path = REPO_ROOT / "configs" / "optuna_tiny.toml"
 
     study = run_study(
         base_config_path=config_path,
@@ -103,11 +105,13 @@ def test_optuna_study_runs_two_tiny_cpu_trials_without_test_split(tmp_path):
         n_trials=2,
         study_name="tiny_cpu_test",
         seed=7,
+        optuna_config_path=optuna_config_path,
     )
 
     assert len(study.trials) == 2
     assert study.best_trial.value is not None
     assert (study_dir / "study_summary.json").exists()
+    assert (study_dir / "optuna_config.toml").exists()
 
     for trial_number in range(2):
         trial_dir = study_dir / f"trial_{trial_number:04d}"
@@ -121,3 +125,32 @@ def test_optuna_study_runs_two_tiny_cpu_trials_without_test_split(tmp_path):
     first_trial_config = toml.load(study_dir / "trial_0000" / "trial_config.toml")
     assert first_trial_config["evaluation"]["run_test"] is False
     assert first_trial_config["model"]["use_flash_attention"] is False
+    assert first_trial_config["data"]["max_hits"] == 16
+    assert first_trial_config["training"]["total_epochs"] == 1
+    assert first_trial_config["model"]["embed_dim"] % first_trial_config["model"]["num_heads"] == 0
+
+
+def test_optuna_study_keeps_backward_compatible_default_search_space(tmp_path):
+    config_path = _write_tiny_config(tmp_path)
+    base_config = toml.load(config_path)
+
+    class FixedTrial:
+        def __init__(self):
+            self.params = {}
+
+        def suggest_categorical(self, name, choices):
+            self.params[name] = choices[0]
+            return choices[0]
+
+        def suggest_int(self, name, low, high, **kwargs):
+            self.params[name] = low
+            return low
+
+        def suggest_float(self, name, low, high, **kwargs):
+            self.params[name] = low
+            return low
+
+    overrides = suggest_overrides(FixedTrial(), base_config)
+    assert overrides[("model", "use_flash_attention")] is False
+    assert overrides[("model", "embed_dim")] % overrides[("model", "num_heads")] == 0
+    assert ("training", "scheduler", "initial_lr") in overrides
