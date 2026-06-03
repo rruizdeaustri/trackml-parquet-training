@@ -41,11 +41,11 @@ def build_model(config, device):
 def load_checkpoint(model, checkpoint_path, device):
     """Load model weights from a training checkpoint or raw state dict."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = (
-        checkpoint.get("model_state", checkpoint)
-        if isinstance(checkpoint, dict)
-        else checkpoint
-    )
+    state_dict = checkpoint
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get(
+            "model_state_dict", checkpoint.get("model_state", checkpoint)
+        )
     model.load_state_dict(state_dict)
     return checkpoint
 

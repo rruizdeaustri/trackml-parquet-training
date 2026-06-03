@@ -5,7 +5,7 @@ from datetime import datetime
 
 def unique_output_dir(config):
     # Generate a unique directory name using the current timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = os.path.join(config["output"]["base_path"], f"run_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
