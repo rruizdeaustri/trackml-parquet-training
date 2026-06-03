@@ -203,6 +203,12 @@ def validate_config(config):
     _require_positive_int(config, ("training", "batch_size"), errors)
     _require_bool(config, ("training", "shuffle"), errors)
     _require_positive_int(config, ("training", "total_epochs"), errors)
+    if "weight_decay" in config.get("training", {}):
+        weight_decay = _get_config_value(config, ("training", "weight_decay"), errors, (int, float))
+        if weight_decay is not None and (isinstance(weight_decay, bool) or weight_decay < 0):
+            errors.append(
+                "Invalid config key [training].weight_decay: expected a non-negative number"
+            )
     start_from_scratch = _require_bool(config, ("training", "start_from_scratch"), errors)
     if start_from_scratch is False and not config.get("training", {}).get("checkpoint_path"):
         errors.append(
@@ -514,7 +520,8 @@ def setup_training(config, device, scaler=None, resume_checkpoint_path=None):
 
     # optimizer
     initial_lr = config["training"]["scheduler"]["initial_lr"]
-    optimizer = optim.AdamW(model.parameters(), lr=initial_lr)
+    weight_decay = config["training"].get("weight_decay", 0.0)
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=weight_decay)
 
     # scheduler
     mode = config["training"]["scheduler"]["mode"]
@@ -871,7 +878,9 @@ def main(config_path, resume_checkpoint_path=None):
             best_val_trackml,
         ) = setup_training(config, device, scaler=scaler)
     
-    loaders = data_utils.load_dataloader(config, device, mode="all")
+    run_test = config.get("evaluation", {}).get("run_test", False)
+    loader_mode = "all" if run_test else "train"
+    loaders = data_utils.load_dataloader(config, device, mode=loader_mode)
     train_loader = loaders["train"]
     val_loader = loaders["val"]
     test_loader = loaders.get("test")
@@ -1003,7 +1012,6 @@ def main(config_path, resume_checkpoint_path=None):
         )
         model.eval()
 
-    run_test = config.get("evaluation", {}).get("run_test", False)
     if run_test and test_loader is not None and helper_loader is not None:
         truths_df = data_utils.load_truths(config)
         if truths_df is None:
@@ -1017,6 +1025,13 @@ def main(config_path, resume_checkpoint_path=None):
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f"Total Trainable Parameters: {total_params}")
     wandb_logger.finish()
+    return {
+        "output_dir": output_dir,
+        "checkpoint_dir": checkpoint_output_dir,
+        "best_val_loss": best_val_loss if not just_eval else None,
+        "best_val_trackml": best_val_trackml if not just_eval else None,
+        "total_params": total_params,
+    }
 
 
 if __name__ == "__main__":
