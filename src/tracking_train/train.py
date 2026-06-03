@@ -9,6 +9,7 @@ import toml
 import logging
 import wandb
 import argparse
+import copy
 from tracking_train.models.cla_model import ClaModel, TransformerClassifier, generate_flex_padding_mask, generate_cluster_padding_mask, generate_sliding_window_padding_mask, token_pad_mask_from_seq_lengths, generate_distance_mask, generate_deltar_cone_mask
 import tracking_train.metrics.trackml as metrics_calculator
 import tracking_train.utils.training as training_utils
@@ -327,6 +328,134 @@ def setup_logging(config, output_dir):
         level=level,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+        force=True,
+    )
+
+
+def checkpoint_dir(output_dir):
+    """Return the run-local checkpoint directory, creating it if needed."""
+    path = os.path.join(output_dir, "checkpoints")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _checkpoint_state_dict(checkpoint, *names):
+    """Return the first matching state-dict entry from a checkpoint."""
+    if not isinstance(checkpoint, dict):
+        return None
+    for name in names:
+        state = checkpoint.get(name)
+        if state is not None:
+            return state
+    return None
+
+
+def load_training_checkpoint(
+    checkpoint_path,
+    model,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    device=None,
+):
+    """Load a training checkpoint, supporting both new and legacy key names."""
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device or "cpu", weights_only=False
+    )
+    model_state = (
+        _checkpoint_state_dict(checkpoint, "model_state_dict", "model_state")
+        if isinstance(checkpoint, dict)
+        else checkpoint
+    )
+    if model_state is None:
+        raise KeyError(
+            f"Checkpoint {checkpoint_path!r} does not contain model weights."
+        )
+    model.load_state_dict(model_state)
+
+    optimizer_state = _checkpoint_state_dict(
+        checkpoint, "optimizer_state_dict", "optimizer_state"
+    )
+    if optimizer is not None and optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+
+    scheduler_state = _checkpoint_state_dict(
+        checkpoint, "scheduler_state_dict", "scheduler_state"
+    )
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+
+    scaler_state = _checkpoint_state_dict(
+        checkpoint, "scaler_state_dict", "scaler_state"
+    )
+    if scaler is not None and scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+
+    start_epoch = (
+        checkpoint.get("epoch", -1) + 1 if isinstance(checkpoint, dict) else 0
+    )
+    best_val_loss = (
+        checkpoint.get("best_val_loss", math.inf)
+        if isinstance(checkpoint, dict)
+        else math.inf
+    )
+    best_val_trackml = (
+        checkpoint.get("best_val_trackml", None)
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    return checkpoint, start_epoch, best_val_loss, best_val_trackml
+
+
+def build_checkpoint(
+    epoch,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    config,
+    best_val_loss,
+    best_val_trackml,
+):
+    """Build a complete, self-contained training checkpoint dictionary."""
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "config": copy.deepcopy(config),
+        "best_val_loss": best_val_loss,
+        "best_val_trackml": best_val_trackml,
+    }
+    if scaler is not None:
+        checkpoint["scaler_state_dict"] = scaler.state_dict()
+    return checkpoint
+
+
+def save_checkpoint(
+    path,
+    epoch,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    config,
+    best_val_loss,
+    best_val_trackml,
+):
+    """Save a complete training checkpoint to ``path``."""
+    torch.save(
+        build_checkpoint(
+            epoch,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            best_val_loss,
+            best_val_trackml,
+        ),
+        path,
     )
 
 def initialize_wandb(config, output_dir):
@@ -350,8 +479,8 @@ def initialize_wandb(config, output_dir):
     return wandb_logger
 
 
-def setup_training(config, device):
-    """Construct model, optimizer, scheduler, and loss; optionally load checkpoint.
+def setup_training(config, device, scaler=None, resume_checkpoint_path=None):
+    """Construct model, optimizer, scheduler, loss, and optional resume state.
 
     Parameters
     ----------
@@ -359,19 +488,16 @@ def setup_training(config, device):
         Full configuration dictionary loaded from TOML.
     device:
         Target device.
+    scaler:
+        Optional AMP gradient scaler to restore when checkpoint state is available.
+    resume_checkpoint_path:
+        Optional CLI-provided checkpoint path. When omitted,
+        config["training"]["checkpoint_path"] is used if start_from_scratch is false.
 
     Returns
     -------
-    model:
-        Classification-only model on the given device.
-    optimizer:
-        AdamW optimizer over model parameters.
-    lr_scheduler:
-        ReduceLROnPlateau scheduler configured from config["training"]["scheduler"].
-    cla_criterion:
-        Classification loss.
-    start_epoch:
-        Epoch index to start from, either 0 or checkpoint_epoch + 1.
+    model, optimizer, lr_scheduler, cla_criterion, start_epoch, best_val_loss, best_val_trackml
+        Training components and checkpoint bookkeeping.
     """
     model = ClaModel(
         TransformerClassifier(
@@ -402,40 +528,52 @@ def setup_training(config, device):
     cla_criterion  = nn.CrossEntropyLoss(ignore_index=-1, reduction="none")
 
     # check whether to load from checkpoint
-    if not config["training"]["start_from_scratch"]:
-        if (
-            "checkpoint_path" not in config["training"]
-            or not config["training"]["checkpoint_path"]
-        ):
-            logging.error(
-                "Checkpoint path must be provided when resuming from a checkpoint."
-            )
-            sys.exit(
-                "Error: Checkpoint path not provided but required for resuming training."
-            )
-        elif not os.path.exists(config["training"]["checkpoint_path"]):
-            logging.error(
-                f"Checkpoint file not found: {config['training']['checkpoint_path']}"
-            )
-            sys.exit("Error: Checkpoint file does not exist.")
-        else:
-            checkpoint = torch.load(config["training"]["checkpoint_path"])
-            model.load_state_dict(checkpoint["model_state"])
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            lr_scheduler.load_state_dict(checkpoint["scheduler_state"])
-            start_epoch = checkpoint["epoch"] + 1
-            logging.info("Resuming training from checkpoint.")
-    else:
-        start_epoch = 0
-        if (
-            "checkpoint_path" in config["training"]
-            and config["training"]["checkpoint_path"]
-        ):
-            logging.warning(
-                "Checkpoint path provided but will not be used since training starts from scratch."
-            )
+    checkpoint_path = resume_checkpoint_path or config["training"].get("checkpoint_path")
+    should_resume = bool(checkpoint_path) and not config["training"].get(
+        "start_from_scratch", True
+    )
+    start_epoch = 0
+    best_val_loss = math.inf
+    best_val_trackml = None
 
-    return model, optimizer, lr_scheduler, cla_criterion, start_epoch
+    if should_resume:
+        if not os.path.exists(checkpoint_path):
+            logging.error("Checkpoint file not found: %s", checkpoint_path)
+            sys.exit("Error: Checkpoint file does not exist.")
+        _, start_epoch, best_val_loss, best_val_trackml = load_training_checkpoint(
+            checkpoint_path,
+            model,
+            optimizer=optimizer,
+            scheduler=lr_scheduler,
+            scaler=scaler,
+            device=device,
+        )
+        logging.info(
+            "Resuming training from checkpoint %s at epoch %s.",
+            checkpoint_path,
+            start_epoch,
+        )
+    elif not config["training"].get("start_from_scratch", True):
+        logging.error(
+            "Checkpoint path must be provided when resuming from a checkpoint."
+        )
+        sys.exit(
+            "Error: Checkpoint path not provided but required for resuming training."
+        )
+    elif checkpoint_path:
+        logging.warning(
+            "Checkpoint path provided but will not be used since training starts from scratch."
+        )
+
+    return (
+        model,
+        optimizer,
+        lr_scheduler,
+        cla_criterion,
+        start_epoch,
+        best_val_loss,
+        best_val_trackml,
+    )
 
 
 def train_epoch(
@@ -464,7 +602,11 @@ def train_epoch(
         # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
         flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
             logits, pad_mask = model(coords, f'train_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             tot_loss = compute_losses(cla_criterion, logits, labels, pad_mask)
@@ -536,7 +678,11 @@ def validate_epoch(
         # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
         flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ):
             logits, pad_mask = model(coords, f'validation_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             tot_loss = compute_losses(cla_criterion, logits, labels, pad_mask)
@@ -566,12 +712,12 @@ def validate_epoch(
         }
     )
 
+    epoch_score = metrics_calculator.calculate_trackml_score()
     if epoch % 10 == 0:
-        epoch_score = metrics_calculator.calculate_trackml_score()
         logging.info(f"Val TrackML score: {epoch_score:.2f}%")
         wandb_logger.log({"val_score": epoch_score, "epoch": epoch})
 
-    return epoch_loss
+    return epoch_loss, epoch_score
 
 def binary_roc_curve(y_true, y_score):
     desc_score_indices = np.argsort(-y_score)
@@ -621,7 +767,11 @@ def test(
             # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
             flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
                 logits, _ = model(coords, f'test_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             # Build token pad mask (True = padded)
@@ -689,14 +839,19 @@ def test(
     )
 
 
-def main(config_path):
+def main(config_path, resume_checkpoint_path=None):
     just_eval = False
     config = load_config(config_path)
+    if resume_checkpoint_path:
+        config["training"]["start_from_scratch"] = False
+        config["training"]["checkpoint_path"] = resume_checkpoint_path
     output_dir = output_utils.unique_output_dir(config)  # with time stamp
     output_utils.copy_config_to_output(config_path, output_dir)
     setup_logging(config, output_dir)
     wandb_logger = initialize_wandb(config, output_dir)
+    checkpoint_output_dir = checkpoint_dir(output_dir)
     logging.info(f"output_dir: {output_dir}")
+    logging.info(f"checkpoint_dir: {checkpoint_output_dir}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
@@ -705,10 +860,16 @@ def main(config_path):
         early_stopper = training_utils.EarlyStopping(
             config["training"]["early_stopping"], output_dir
         )
-        scaler = GradScaler()
-        model, optimizer, lr_scheduler, cla_criterion, start_epoch = setup_training(
-            config, device
-        )
+        scaler = GradScaler(enabled=device.type == "cuda")
+        (
+            model,
+            optimizer,
+            lr_scheduler,
+            cla_criterion,
+            start_epoch,
+            best_val_loss,
+            best_val_trackml,
+        ) = setup_training(config, device, scaler=scaler)
     
     loaders = data_utils.load_dataloader(config, device, mode="all")
     train_loader = loaders["train"]
@@ -745,7 +906,7 @@ def main(config_path):
                 output_dir,
             )
 
-            val_loss = validate_epoch(
+            val_loss, val_trackml = validate_epoch(
                 model,
                 val_loader,
                 cla_criterion,
@@ -762,38 +923,65 @@ def main(config_path):
                 logging.info(f"lr: {current_lr}")
                 wandb_logger.log({"lr": current_lr})
 
-            # stop training and checkpoint the model if val loss stops improving
-            early_stopper(val_loss)
-            if early_stopper.should_stop():
-                logging.info("Early stopping triggered. Saving checkpoint.")
-                wandb_logger.save_model(
+            val_loss_improved = val_loss < best_val_loss
+            val_trackml_improved = val_trackml is not None and (
+                best_val_trackml is None or val_trackml > best_val_trackml
+            )
+            if val_loss_improved:
+                best_val_loss = val_loss
+            if val_trackml_improved:
+                best_val_trackml = val_trackml
+
+            if val_loss_improved:
+                save_checkpoint(
+                    os.path.join(checkpoint_output_dir, "best_val_loss.pt"),
+                    epoch,
                     model,
-                    f"model_earlystop_epoch_{epoch}.pth",
                     optimizer,
                     lr_scheduler,
-                    epoch,
-                    output_dir,
+                    scaler,
+                    config,
+                    best_val_loss,
+                    best_val_trackml,
                 )
-                logging.info("Checkpoint saved to output_dir.")
+                logging.info("Saved new best validation-loss checkpoint.")
+
+            if val_trackml_improved:
+                save_checkpoint(
+                    os.path.join(checkpoint_output_dir, "best_val_trackml.pt"),
+                    epoch,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    scaler,
+                    config,
+                    best_val_loss,
+                    best_val_trackml,
+                )
+                logging.info("Saved new best validation-TrackML checkpoint.")
+
+            save_checkpoint(
+                os.path.join(checkpoint_output_dir, "last.pt"),
+                epoch,
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                config,
+                best_val_loss,
+                best_val_trackml,
+            )
+            logging.info("Saved last checkpoint for epoch %s.", epoch)
+
+            # stop training if val loss stops improving
+            early_stopper(val_loss)
+            if early_stopper.should_stop():
+                logging.info("Early stopping triggered.")
                 break
             # learning rate warm-up
             training_utils.adjust_learning_rate(optimizer, epoch, config)
 
-            if epoch % config["logging"]["model_save_interval"] == 0:
-                wandb_logger.save_model(
-                    model,
-                    f"model_epoch_{epoch}.pth",
-                    optimizer,
-                    lr_scheduler,
-                    epoch,
-                    output_dir,
-                )
-
         logging.info("Finished training.")
-        wandb_logger.save_model(
-            model, "model_final.pth", optimizer, lr_scheduler, epoch, output_dir
-        )
-        logging.info("Checkpoint saved to output_dir.")
     else:
         model = ClaModel(
             TransformerClassifier(
@@ -838,6 +1026,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "config_path", type=str, help="Path to the configuration TOML file."
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a checkpoint to resume from. Overrides [training].checkpoint_path.",
+    )
 
     args = parser.parse_args()
-    main(args.config_path)
+    main(args.config_path, resume_checkpoint_path=args.resume)

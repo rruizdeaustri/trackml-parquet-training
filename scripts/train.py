@@ -5,5 +5,10 @@ from tracking_train.train import main
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the tracking classifier")
     parser.add_argument("config", help="Path to TOML config")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a checkpoint to resume from. Overrides [training].checkpoint_path.",
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, resume_checkpoint_path=args.resume)
