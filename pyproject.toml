@@ -16,6 +16,7 @@ dependencies = [
   "matplotlib",
   "wandb",
   "psutil",
+  "optuna",
 ]
 
 [tool.setuptools.packages.find]
