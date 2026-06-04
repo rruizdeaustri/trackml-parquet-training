@@ -2,6 +2,17 @@
 # Keep this separate from the base training config, e.g.:
 # python scripts/optuna_study.py configs/parquet.toml /path/to/study --optuna-config configs/optuna_trackml.toml --n-trials 50
 
+[fixed.model]
+# In the current code this flag actually activates the PyTorch FlexAttention path.
+# It is not the external flash-attn package.
+use_flash_attention = true
+
+[fixed.training]
+start_from_scratch = true
+total_epochs = 50
+precision = "bf16"
+batch_size = 128
+
 [fixed.training]
 start_from_scratch = true
 total_epochs = 50

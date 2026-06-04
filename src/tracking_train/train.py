@@ -10,6 +10,8 @@ import logging
 import wandb
 import argparse
 import copy
+from contextlib import nullcontext
+
 from tracking_train.models.cla_model import ClaModel, TransformerClassifier, generate_flex_padding_mask, generate_cluster_padding_mask, generate_sliding_window_padding_mask, token_pad_mask_from_seq_lengths, generate_distance_mask, generate_deltar_cone_mask
 import tracking_train.metrics.trackml as metrics_calculator
 import tracking_train.utils.training as training_utils
@@ -22,8 +24,6 @@ import math
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# import torch.nn.functional as F
-
 torch.set_float32_matmul_precision('high')
 torch.set_default_dtype(torch.float32)
 
@@ -34,6 +34,26 @@ torch.set_default_dtype(torch.float32)
 # np.random.seed(42)
 
 
+def autocast_context(config, device):
+    precision = config["training"].get("precision", "bf16")
+
+    if device.type != "cuda" or precision == "fp32":
+        return nullcontext()
+
+    if precision == "bf16":
+        return autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True)
+
+    if precision == "fp16":
+        return autocast(device_type=device.type, dtype=torch.float16, enabled=True)
+
+    raise ValueError(
+        f"Unknown training.precision={precision!r}. "
+        "Expected 'fp32', 'bf16', or 'fp16'."
+    )
+
+
+def use_grad_scaler(config, device):
+    return device.type == "cuda" and config["training"].get("precision", "bf16") == "fp16"
 
 class ConfigError(ValueError):
     """Raised when a TOML training configuration is missing or inconsistent."""
@@ -251,6 +271,13 @@ def validate_config(config):
     _require_nonempty_string(config, ("output", "base_path"), errors)
     _require_bool(config, ("wandb", "enabled"), errors)
 
+
+    precision = config.get("training", {}).get("precision", "bf16")
+    if precision not in {"fp32", "bf16", "fp16"}:
+        errors.append(
+            "Invalid config key [training].precision: expected 'fp32', 'bf16', or 'fp16'"
+        )
+    
     if errors:
         raise ConfigError("Invalid training config:\n- " + "\n- ".join(errors))
     return config
@@ -609,15 +636,17 @@ def train_epoch(
         # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
         flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-        with autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
+        with autocast_context(config, device):
+        #with autocast(
+        #    device_type=device.type,
+        #    dtype=torch.bfloat16,
+        #    enabled=device.type == "cuda",
+        #):
             logits, pad_mask = model(coords, f'train_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             tot_loss = compute_losses(cla_criterion, logits, labels, pad_mask)
 
+        """    
         scaler.scale(tot_loss).backward()
 
         if config["logging"]["level"] == "DEBUG":
@@ -625,6 +654,22 @@ def train_epoch(
 
         scaler.step(optimizer)
         scaler.update()
+        """
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(tot_loss).backward()
+
+            if config["logging"]["level"] == "DEBUG":
+                wandb_logger.log_gradient_norm(model)
+
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            tot_loss.backward()
+
+            if config["logging"]["level"] == "DEBUG":
+                wandb_logger.log_gradient_norm(model)
+
+            optimizer.step()
 
         
         metrics_calculator.update(
@@ -685,11 +730,12 @@ def validate_epoch(
         # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
         flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-        with autocast(
-            device_type=device.type,
-            dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
+        with autocast_context(config, device):
+        #with autocast(
+        #    device_type=device.type,
+        #    dtype=torch.bfloat16,
+        #    enabled=device.type == "cuda",
+        #):
             logits, pad_mask = model(coords, f'validation_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             tot_loss = compute_losses(cla_criterion, logits, labels, pad_mask)
@@ -774,11 +820,12 @@ def test(
             # flex_padding_mask = generate_distance_mask(seq_lengths, pos_enc[:,:,1])
             flex_padding_mask = generate_deltar_cone_mask(seq_lengths, pos_enc[:,:,3], pos_enc[:,:,4])
 
-            with autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=device.type == "cuda",
-            ):
+            with autocast_context(config, device):
+            #with autocast(
+            #    device_type=device.type,
+            #    dtype=torch.bfloat16,
+            #    enabled=device.type == "cuda",
+            #):
                 logits, _ = model(coords, f'test_{i}', flex_padding_mask, seq_lengths, pos_enc)
 
             # Build token pad mask (True = padded)
@@ -867,7 +914,9 @@ def main(config_path, resume_checkpoint_path=None):
         early_stopper = training_utils.EarlyStopping(
             config["training"]["early_stopping"], output_dir
         )
-        scaler = GradScaler(enabled=device.type == "cuda")
+        
+        #scaler = GradScaler(enabled=device.type == "cuda")
+        scaler = GradScaler(enabled=use_grad_scaler(config, device))
         (
             model,
             optimizer,
