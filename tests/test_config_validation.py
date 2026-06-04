@@ -21,6 +21,7 @@ def test_tiny_debug_config_is_valid():
 
     assert config["data"]["parquet_dir"] == "data_examples"
     assert config["data"]["label_mode"] == "class_id"
+    assert config["model"]["attention_backend"] == "standard"
     assert config["model"]["use_flash_attention"] is False
 
 
@@ -54,4 +55,46 @@ def test_config_validation_fails_early_with_clear_messages(mutate, message):
     mutate(config)
 
     with pytest.raises(ConfigError, match=re.escape(message)):
+        validate_config(config)
+
+
+def test_attention_backend_new_key_selects_flex_and_populates_legacy_alias():
+    config = deepcopy(tiny_debug_config())
+    config["model"].pop("use_flash_attention", None)
+    config["model"]["attention_backend"] = "flex"
+
+    validated = validate_config(config)
+
+    assert validated["model"]["attention_backend"] == "flex"
+    assert validated["model"]["use_flash_attention"] is True
+
+
+def test_deprecated_use_flash_attention_false_selects_standard_backend():
+    config = deepcopy(tiny_debug_config())
+    config["model"].pop("attention_backend", None)
+    config["model"]["use_flash_attention"] = False
+
+    validated = validate_config(config)
+
+    assert validated["model"]["attention_backend"] == "standard"
+    assert validated["model"]["use_flash_attention"] is False
+
+
+def test_deprecated_use_flash_attention_true_selects_flex_backend():
+    config = deepcopy(tiny_debug_config())
+    config["model"].pop("attention_backend", None)
+    config["model"]["use_flash_attention"] = True
+
+    validated = validate_config(config)
+
+    assert validated["model"]["attention_backend"] == "flex"
+    assert validated["model"]["use_flash_attention"] is True
+
+
+def test_attention_backend_rejects_unknown_value():
+    config = deepcopy(tiny_debug_config())
+    config["model"].pop("use_flash_attention", None)
+    config["model"]["attention_backend"] = "flash"
+
+    with pytest.raises(ConfigError, match="attention_backend"):
         validate_config(config)

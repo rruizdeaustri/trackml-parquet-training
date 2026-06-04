@@ -16,7 +16,7 @@ from tracking_train.train import main as train_main
 def _write_tiny_config(tmp_path, total_epochs=1):
     config = toml.load(REPO_ROOT / "configs" / "tiny_debug.toml")
     config["data"]["parquet_dir"] = str(REPO_ROOT / config["data"]["parquet_dir"])
-    config["model"]["use_flash_attention"] = False
+    config["model"]["attention_backend"] = "standard"
     config["training"]["total_epochs"] = total_epochs
     config["training"]["start_from_scratch"] = True
     config["training"]["checkpoint_path"] = ""

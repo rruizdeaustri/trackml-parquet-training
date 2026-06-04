@@ -37,7 +37,7 @@ OptunaConfig = dict[str, Any]
 
 DEFAULT_OPTUNA_CONFIG: OptunaConfig = {
     "fixed": {
-        "model": {"use_flash_attention": False},
+        "model": {"attention_backend": "standard"},
     },
     "search": {
         "data": {

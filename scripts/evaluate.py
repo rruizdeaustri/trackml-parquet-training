@@ -32,7 +32,7 @@ def build_model(config, device):
             num_layers=config["model"]["num_layers"],
             dim_feedforward=config["model"]["dim_feedforward"],
             dropout=config["model"]["dropout"],
-            use_flash_attention=config["model"]["use_flash_attention"],
+            attention_backend=config["model"]["attention_backend"],
         )
     )
     return model.to(device)
@@ -78,7 +78,7 @@ def evaluate_test_split(
             seq_lengths = seq_lengths.to(device)
 
             flex_padding_mask = None
-            if config["model"].get("use_flash_attention", False):
+            if config["model"].get("attention_backend") == "flex":
                 flex_padding_mask = generate_deltar_cone_mask(
                     seq_lengths, pos_enc[:, :, 3], pos_enc[:, :, 4]
                 )
@@ -157,6 +157,7 @@ def main(config_path, checkpoint_path, device_name=None):
     logging.info("output_dir: %s", output_dir)
     logging.info("Device: %s", device)
     logging.info("Checkpoint: %s", checkpoint_path)
+    logging.info("Attention backend: %s", config["model"]["attention_backend"])
 
     model = build_model(config, device)
     checkpoint = load_checkpoint(model, checkpoint_path, device)

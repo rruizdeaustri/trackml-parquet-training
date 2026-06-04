@@ -37,13 +37,20 @@ class ClaModel(nn.Module):
         return logits, padding_mask
     
 class TransformerRegressor(nn.Module):
-    """Transformer-based regressor using flex attention via CustomTransformerEncoder."""
+    """Transformer-based regressor with selectable standard or FlexAttention backend."""
     def __init__(self, inputfeature_dim: int, num_params: int, num_heads: int, 
-                 embed_dim: int, num_layers: int, dim_feedforward: int, use_flash_attention: bool=False, is_causal: bool=False, dropout:float=0.0):
+                 embed_dim: int, num_layers: int, dim_feedforward: int, use_flash_attention: bool=False, attention_backend: str | None=None, is_causal: bool=False, dropout:float=0.0):
         super(TransformerRegressor, self).__init__()
         assert embed_dim % num_heads == 0
         self.embedding = nn.Linear(inputfeature_dim, embed_dim)
-        if use_flash_attention:
+        attention_backend = attention_backend or ("flex" if use_flash_attention else "standard")
+        if attention_backend not in {"standard", "flex"}:
+            raise ValueError(f"Unknown attention_backend={attention_backend!r}; expected 'standard' or 'flex'.")
+        self.attention_backend = attention_backend
+        # Deprecated compatibility attribute; FlexAttention was historically
+        # selected by the misleading use_flash_attention flag.
+        self.use_flash_attention = attention_backend == "flex"
+        if self.attention_backend == "flex":
             encoder_layer = CustomTransformerEncoderLayer(
                 embed_dim,
                 num_heads,
@@ -51,6 +58,11 @@ class TransformerRegressor(nn.Module):
                 dropout=dropout,
                 batch_first=True
                 )
+            self.encoder = CustomTransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
         else:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -61,11 +73,11 @@ class TransformerRegressor(nn.Module):
                 # as (batch, seq, feature). Default: "False" (seq, batch, feature).
                 batch_first=True,
             )
-        self.encoder = CustomTransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-            enable_nested_tensor=False,
-        )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
         self.regressor = nn.Linear(embed_dim, num_params)
         #self.num_params = num_params
         self.num_heads = num_heads
@@ -112,27 +124,35 @@ class TransformerRegressor(nn.Module):
     def forward(self, input, batch_name, flex_padding_mask):
         x = self.embedding(input)
 
-        # Creating mask for flex attention
-        B, S = input.size(0), input.size(1)
-        key = (batch_name, B, S)
-        mask_gpu = self.build_or_reuse_gpu_mask(key, flex_padding_mask, B, S)
-
-        memory = self.encoder(src=x, flex_mask=mask_gpu)
+        if self.attention_backend == "flex":
+            # Creating mask for flex attention
+            B, S = input.size(0), input.size(1)
+            key = (batch_name, B, S)
+            mask_gpu = self.build_or_reuse_gpu_mask(key, flex_padding_mask, B, S)
+            memory = self.encoder(src=x, flex_mask=mask_gpu)
+        else:
+            memory = self.encoder(src=x)
         out = self.regressor(memory)
 
         return out
 
 class TransformerClassifier(nn.Module):
-    """Transformer-based classifier using flex attention via CustomTransformerEncoder."""
+    """Transformer-based classifier with selectable standard or FlexAttention backend."""
     def __init__(self, inputfeature_dim: int, num_classes: int, num_heads: int, 
-                 embed_dim: int, num_layers: int, dim_feedforward: int, use_flash_attention: bool=False, is_causal: bool=False, dropout:float=0.0):
+                 embed_dim: int, num_layers: int, dim_feedforward: int, use_flash_attention: bool=False, attention_backend: str | None=None, is_causal: bool=False, dropout:float=0.0):
         super(TransformerClassifier, self).__init__()
         assert embed_dim % num_heads == 0
         self.embedding = nn.Linear(inputfeature_dim, embed_dim)
 #        self.pos_enc_layerid = nn.Embedding(13, embed_dim)
 #        self.pos_enc_moduleid = nn.Embedding(3192, embed_dim)
-        self.use_flash_attention = use_flash_attention
-        if use_flash_attention:
+        attention_backend = attention_backend or ("flex" if use_flash_attention else "standard")
+        if attention_backend not in {"standard", "flex"}:
+            raise ValueError(f"Unknown attention_backend={attention_backend!r}; expected 'standard' or 'flex'.")
+        self.attention_backend = attention_backend
+        # Deprecated compatibility attribute; FlexAttention was historically
+        # selected by the misleading use_flash_attention flag.
+        self.use_flash_attention = attention_backend == "flex"
+        if self.attention_backend == "flex":
             encoder_layer = CustomTransformerEncoderLayer(
                 embed_dim,
                 num_heads,
@@ -187,7 +207,7 @@ class TransformerClassifier(nn.Module):
  #       pos_emb = layer_enc + module_enc
  #       x = x + pos_emb
 
-        if self.use_flash_attention:
+        if self.attention_backend == "flex":
             # Creating mask for flex attention
             B, S = input.size(0), input.size(1)
             key = (batch_name, B, S)
