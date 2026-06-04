@@ -1,6 +1,13 @@
 # Tiny CPU-safe Optuna search space for smoke tests.
 # Use with: python scripts/optuna_study.py configs/tiny_debug.toml --optuna-config configs/optuna_tiny.toml
 
+[study]
+study_name = "trackml_optuna_tiny"
+n_trials = 2
+seed = 12345
+direction = "maximize"
+# storage = "sqlite:///runs/optuna_tiny.db"
+
 [fixed.data]
 max_hits = 16
 

@@ -13,7 +13,6 @@ import argparse
 import copy
 import json
 import math
-import shutil
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -33,6 +32,15 @@ from tracking_train.train import main as train_main
 TRACKML_FALLBACK_THRESHOLD = 0.0
 SuggestionPath = tuple[str, ...]
 OptunaConfig = dict[str, Any]
+
+
+DEFAULT_STUDY_SETTINGS: dict[str, Any] = {
+    "study_name": "trackml_optuna",
+    "n_trials": 2,
+    "seed": 12345,
+    "direction": "maximize",
+    "storage": None,
+}
 
 
 DEFAULT_OPTUNA_CONFIG: OptunaConfig = {
@@ -256,13 +264,63 @@ def _assert_compatible(overrides: dict[SuggestionPath, Any], base_config: dict[s
 def load_optuna_config(optuna_config_path: str | Path | None) -> OptunaConfig:
     """Load an Optuna search-space config or return the backward-compatible default."""
     if optuna_config_path is None:
-        return copy.deepcopy(DEFAULT_OPTUNA_CONFIG)
-    config = toml.load(Path(optuna_config_path))
+        config = copy.deepcopy(DEFAULT_OPTUNA_CONFIG)
+    else:
+        config = toml.load(Path(optuna_config_path))
+    config.setdefault("study", {})
     config.setdefault("fixed", {})
     config.setdefault("search", {})
     config.setdefault("constraints", {})
     config["constraints"].setdefault("embed_dim_divisible_by_num_heads", True)
     return config
+
+
+def _resolve_study_settings(
+    optuna_config: OptunaConfig,
+    *,
+    n_trials: int | None = None,
+    study_name: str | None = None,
+    storage: str | None = None,
+    seed: int | None = None,
+    direction: str | None = None,
+) -> dict[str, Any]:
+    """Merge defaults, TOML [study] values, and explicit CLI/API overrides."""
+    study_config = optuna_config.get("study", {})
+    if study_config is None:
+        study_config = {}
+    if not isinstance(study_config, dict):
+        raise ValueError("Optuna config [study] section must be a table.")
+
+    settings = copy.deepcopy(DEFAULT_STUDY_SETTINGS)
+    toml_study_name = study_config.get("study_name", study_config.get("name"))
+    if toml_study_name is not None:
+        settings["study_name"] = str(toml_study_name)
+    for key in ("n_trials", "seed", "direction", "storage"):
+        if key in study_config:
+            settings[key] = study_config[key]
+
+    explicit_overrides = {
+        "study_name": study_name,
+        "n_trials": n_trials,
+        "seed": seed,
+        "direction": direction,
+        "storage": storage,
+    }
+    for key, value in explicit_overrides.items():
+        if value is not None:
+            settings[key] = value
+
+    settings["n_trials"] = int(settings["n_trials"])
+    if settings["n_trials"] < 1:
+        raise ValueError("Study n_trials must be at least 1.")
+
+    settings["study_name"] = str(settings["study_name"])
+    settings["seed"] = None if settings.get("seed") is None else int(settings["seed"])
+    settings["storage"] = None if settings.get("storage") in {None, ""} else str(settings["storage"])
+    settings["direction"] = str(settings["direction"]).lower()
+    if settings["direction"] not in {"maximize", "minimize"}:
+        raise ValueError("Study direction must be either 'maximize' or 'minimize'.")
+    return settings
 
 
 def suggest_overrides(
@@ -348,24 +406,25 @@ def objective_from_summary(summary: dict[str, Any], trial: optuna.Trial) -> floa
     return -float(val_loss)
 
 
-def _save_optuna_config(study_dir: Path, optuna_config: OptunaConfig, optuna_config_path: str | Path | None) -> Path:
+def _save_optuna_config(study_dir: Path, optuna_config: OptunaConfig, study_settings: dict[str, Any]) -> Path:
+    """Save the effective Optuna config, including resolved study settings."""
     destination = study_dir / "optuna_config.toml"
-    if optuna_config_path is not None:
-        shutil.copyfile(Path(optuna_config_path), destination)
-    else:
-        with destination.open("w", encoding="utf-8") as config_file:
-            toml.dump(optuna_config, config_file)
+    effective_config = copy.deepcopy(optuna_config)
+    effective_config["study"] = copy.deepcopy(study_settings)
+    with destination.open("w", encoding="utf-8") as config_file:
+        toml.dump(effective_config, config_file)
     return destination
 
 
 def run_study(
     base_config_path: str | Path,
     study_dir: str | Path | None = None,
-    n_trials: int = 2,
-    study_name: str = "trackml_optuna",
+    n_trials: int | None = None,
+    study_name: str | None = None,
     storage: str | None = None,
-    seed: int | None = 12345,
+    seed: int | None = None,
     optuna_config_path: str | Path | None = None,
+    direction: str | None = None,
 ) -> optuna.Study:
     """Run an Optuna study and return the completed study object."""
     base_config_path = Path(base_config_path)
@@ -374,14 +433,22 @@ def run_study(
 
     base_config = toml.load(base_config_path)
     optuna_config = load_optuna_config(optuna_config_path)
-    saved_optuna_config_path = _save_optuna_config(study_dir, optuna_config, optuna_config_path)
-
-    sampler = optuna.samplers.TPESampler(seed=seed)
-    study = optuna.create_study(
-        direction="maximize",
+    study_settings = _resolve_study_settings(
+        optuna_config,
+        n_trials=n_trials,
         study_name=study_name,
         storage=storage,
-        load_if_exists=storage is not None,
+        seed=seed,
+        direction=direction,
+    )
+    saved_optuna_config_path = _save_optuna_config(study_dir, optuna_config, study_settings)
+
+    sampler = optuna.samplers.TPESampler(seed=study_settings["seed"])
+    study = optuna.create_study(
+        direction=study_settings["direction"],
+        study_name=study_settings["study_name"],
+        storage=study_settings["storage"],
+        load_if_exists=study_settings["storage"] is not None,
         sampler=sampler,
     )
 
@@ -398,7 +465,7 @@ def run_study(
         trial.set_user_attr("output_dir", summary.get("output_dir"))
         return objective_from_summary(summary, trial)
 
-    study.optimize(objective, n_trials=n_trials)
+    study.optimize(objective, n_trials=study_settings["n_trials"])
 
     summary_path = study_dir / "study_summary.json"
     with summary_path.open("w", encoding="utf-8") as summary_file:
@@ -406,6 +473,7 @@ def run_study(
             {
                 "study_name": study.study_name,
                 "direction": study.direction.name,
+                "study_settings": study_settings,
                 "best_trial_number": study.best_trial.number,
                 "best_value": study.best_value,
                 "best_params": study.best_params,
@@ -428,14 +496,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output study directory. Defaults to runs/optuna_<timestamp>/.",
     )
-    parser.add_argument("--n-trials", type=int, default=2, help="Number of Optuna trials to run.")
-    parser.add_argument("--study-name", default="trackml_optuna", help="Optuna study name.")
+    parser.add_argument("--n-trials", type=int, default=None, help="Number of Optuna trials to run.")
+    parser.add_argument("--study-name", default=None, help="Optuna study name.")
     parser.add_argument(
         "--storage",
         default=None,
         help="Optional Optuna storage URL. Omit for in-memory storage and no generated DB file.",
     )
-    parser.add_argument("--seed", type=int, default=12345, help="Sampler seed for reproducible studies.")
+    parser.add_argument("--seed", type=int, default=None, help="Sampler seed for reproducible studies.")
+    parser.add_argument(
+        "--direction",
+        choices=("maximize", "minimize"),
+        default=None,
+        help="Optuna study direction.",
+    )
     parser.add_argument(
         "--optuna-config",
         default=None,
@@ -454,6 +528,7 @@ def main() -> None:
         storage=args.storage,
         seed=args.seed,
         optuna_config_path=args.optuna_config,
+        direction=args.direction,
     )
 
 

@@ -2,6 +2,13 @@
 # Keep this separate from the base training config, e.g.:
 # python scripts/optuna_study.py configs/parquet.toml /path/to/study --optuna-config configs/optuna_trackml.toml --n-trials 50
 
+[study]
+study_name = "trackml_optuna"
+n_trials = 50
+seed = 12345
+direction = "maximize"
+# storage = "sqlite:///runs/optuna_trackml.db"
+
 [fixed.model]
 attention_backend = "flex"
 

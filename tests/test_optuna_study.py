@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import types
@@ -91,6 +92,97 @@ def _write_tiny_config(tmp_path):
     with config_path.open("w", encoding="utf-8") as config_file:
         toml.dump(config, config_file)
     return config_path
+
+
+def _write_study_only_optuna_config(tmp_path, study_settings):
+    config = {
+        "study": study_settings,
+        "fixed": {"evaluation": {"run_test": False}},
+        "search": {},
+        "constraints": {"embed_dim_divisible_by_num_heads": True},
+    }
+    config_path = tmp_path / "optuna_study_settings.toml"
+    with config_path.open("w", encoding="utf-8") as config_file:
+        toml.dump(config, config_file)
+    return config_path
+
+
+def _stub_train_main(monkeypatch):
+    def fake_train_main(config_path):
+        return {
+            "best_val_trackml": 1.0,
+            "best_val_loss": 0.5,
+            "output_dir": str(Path(config_path).parent),
+        }
+
+    monkeypatch.setattr("scripts.optuna_study.train_main", fake_train_main)
+
+
+def test_optuna_study_reads_n_trials_and_seed_from_toml(tmp_path, monkeypatch):
+    _stub_train_main(monkeypatch)
+    config_path = _write_tiny_config(tmp_path)
+    study_dir = tmp_path / "runs" / "toml_study_settings"
+    optuna_config_path = _write_study_only_optuna_config(
+        tmp_path,
+        {
+            "name": "toml_named_study",
+            "n_trials": 3,
+            "seed": 11,
+            "direction": "maximize",
+        },
+    )
+
+    study = run_study(
+        base_config_path=config_path,
+        study_dir=study_dir,
+        optuna_config_path=optuna_config_path,
+    )
+
+    assert study.study_name == "toml_named_study"
+    assert len(study.trials) == 3
+    effective_config = toml.load(study_dir / "optuna_config.toml")
+    assert effective_config["study"]["study_name"] == "toml_named_study"
+    assert effective_config["study"]["n_trials"] == 3
+    assert effective_config["study"]["seed"] == 11
+    summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
+    assert summary["study_settings"]["study_name"] == "toml_named_study"
+    assert summary["study_settings"]["n_trials"] == 3
+    assert summary["study_settings"]["seed"] == 11
+
+
+def test_optuna_study_cli_arguments_override_toml_study_settings(tmp_path, monkeypatch):
+    _stub_train_main(monkeypatch)
+    config_path = _write_tiny_config(tmp_path)
+    study_dir = tmp_path / "runs" / "cli_overrides"
+    optuna_config_path = _write_study_only_optuna_config(
+        tmp_path,
+        {
+            "study_name": "toml_study",
+            "n_trials": 4,
+            "seed": 22,
+            "direction": "maximize",
+        },
+    )
+
+    study = run_study(
+        base_config_path=config_path,
+        study_dir=study_dir,
+        n_trials=1,
+        study_name="cli_study",
+        seed=99,
+        optuna_config_path=optuna_config_path,
+    )
+
+    assert study.study_name == "cli_study"
+    assert len(study.trials) == 1
+    effective_config = toml.load(study_dir / "optuna_config.toml")
+    assert effective_config["study"]["study_name"] == "cli_study"
+    assert effective_config["study"]["n_trials"] == 1
+    assert effective_config["study"]["seed"] == 99
+    summary = json.loads((study_dir / "study_summary.json").read_text(encoding="utf-8"))
+    assert summary["study_settings"]["study_name"] == "cli_study"
+    assert summary["study_settings"]["n_trials"] == 1
+    assert summary["study_settings"]["seed"] == 99
 
 
 def test_optuna_study_runs_two_tiny_cpu_trials_from_toml_without_cuda(tmp_path):
