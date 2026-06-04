@@ -16,7 +16,7 @@ def test_evaluate_checkpoint_on_tiny_debug_cpu(tmp_path):
     """Evaluate a tiny non-flash checkpoint on only the held-out Parquet test split."""
     config = toml.load(REPO_ROOT / "configs" / "tiny_debug.toml")
     config["data"]["parquet_dir"] = str(REPO_ROOT / config["data"]["parquet_dir"])
-    config["model"]["use_flash_attention"] = False
+    config["model"]["attention_backend"] = "standard"
     config["output"]["base_path"] = str(tmp_path / "outputs")
     config["output"]["base_dir"] = str(tmp_path / "outputs")
 

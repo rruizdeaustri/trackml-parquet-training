@@ -64,10 +64,10 @@ def test_parquet_dataset_one_batch_cpu_training_smoke():
             num_layers=model_cfg["num_layers"],
             dim_feedforward=model_cfg["dim_feedforward"],
             dropout=model_cfg["dropout"],
-            use_flash_attention=model_cfg["use_flash_attention"],
+            attention_backend=model_cfg["attention_backend"],
         )
     )
-    assert not model_cfg["use_flash_attention"]
+    assert model_cfg["attention_backend"] == "standard"
     assert next(model.parameters()).device.type == "cpu"
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["training"]["scheduler"]["initial_lr"])

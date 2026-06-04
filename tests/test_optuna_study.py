@@ -77,7 +77,7 @@ def _write_tiny_config(tmp_path):
     config = toml.load(REPO_ROOT / "configs" / "tiny_debug.toml")
     config["data"]["parquet_dir"] = str(REPO_ROOT / config["data"]["parquet_dir"])
     config["data"]["max_hits"] = 16
-    config["model"]["use_flash_attention"] = False
+    config["model"]["attention_backend"] = "standard"
     config["training"]["batch_size"] = 2
     config["training"]["total_epochs"] = 1
     config["training"]["start_from_scratch"] = True
@@ -124,7 +124,7 @@ def test_optuna_study_runs_two_tiny_cpu_trials_from_toml_without_cuda(tmp_path):
 
     first_trial_config = toml.load(study_dir / "trial_0000" / "trial_config.toml")
     assert first_trial_config["evaluation"]["run_test"] is False
-    assert first_trial_config["model"]["use_flash_attention"] is False
+    assert first_trial_config["model"]["attention_backend"] == "standard"
     assert first_trial_config["data"]["max_hits"] == 16
     assert first_trial_config["training"]["total_epochs"] == 1
     assert first_trial_config["model"]["embed_dim"] % first_trial_config["model"]["num_heads"] == 0
@@ -151,6 +151,6 @@ def test_optuna_study_keeps_backward_compatible_default_search_space(tmp_path):
             return low
 
     overrides = suggest_overrides(FixedTrial(), base_config)
-    assert overrides[("model", "use_flash_attention")] is False
+    assert overrides[("model", "attention_backend")] == "standard"
     assert overrides[("model", "embed_dim")] % overrides[("model", "num_heads")] == 0
     assert ("training", "scheduler", "initial_lr") in overrides

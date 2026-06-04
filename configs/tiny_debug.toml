@@ -19,7 +19,7 @@ embed_dim = 16
 num_layers = 1
 dim_feedforward = 32
 dropout = 0.0
-use_flash_attention = false
+attention_backend = "standard"
 
 [training]
 batch_size = 2

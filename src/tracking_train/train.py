@@ -59,6 +59,22 @@ class ConfigError(ValueError):
     """Raised when a TOML training configuration is missing or inconsistent."""
 
 
+ATTENTION_BACKENDS = {"standard", "flex"}
+
+
+def resolve_attention_backend(model_config):
+    """Return the selected attention backend.
+
+    ``model.attention_backend`` is the preferred config key.  The historical
+    ``model.use_flash_attention`` boolean is deprecated but still supported for
+    backward compatibility; in this codebase it selects the PyTorch
+    FlexAttention implementation, not the external flash-attn package.
+    """
+    if "attention_backend" in model_config:
+        return model_config["attention_backend"]
+    return "flex" if model_config.get("use_flash_attention", False) else "standard"
+
+
 def _toml_path(path):
     if len(path) == 1:
         return f"[{path[0]}]"
@@ -210,7 +226,34 @@ def validate_config(config):
     _require_positive_int(config, ("model", "num_layers"), errors)
     _require_positive_int(config, ("model", "dim_feedforward"), errors)
     dropout = _get_config_value(config, ("model", "dropout"), errors, (int, float))
-    _require_bool(config, ("model", "use_flash_attention"), errors)
+
+    model_config = config.get("model", {})
+    has_attention_backend = "attention_backend" in model_config
+    has_legacy_flash_flag = "use_flash_attention" in model_config
+    if not has_attention_backend and not has_legacy_flash_flag:
+        errors.append(
+            "Missing required config key: [model].attention_backend "
+            "(or deprecated [model].use_flash_attention)"
+        )
+    attention_backend = None
+    if has_attention_backend:
+        attention_backend = _get_config_value(config, ("model", "attention_backend"), errors, str)
+        if attention_backend is not None and attention_backend not in ATTENTION_BACKENDS:
+            errors.append(
+                "Invalid config key [model].attention_backend: expected 'standard' or 'flex'"
+            )
+    if has_legacy_flash_flag:
+        legacy_use_flash = _require_bool(config, ("model", "use_flash_attention"), errors)
+        if (
+            attention_backend in ATTENTION_BACKENDS
+            and legacy_use_flash is not None
+            and (attention_backend == "flex") != legacy_use_flash
+        ):
+            errors.append(
+                "Inconsistent config: [model].attention_backend conflicts with "
+                "deprecated [model].use_flash_attention"
+            )
+
     if embed_dim is not None and num_heads is not None and embed_dim % num_heads != 0:
         errors.append(
             "Inconsistent config: [model].embed_dim must be divisible by [model].num_heads"
@@ -280,6 +323,13 @@ def validate_config(config):
     
     if errors:
         raise ConfigError("Invalid training config:\n- " + "\n- ".join(errors))
+
+    model_config = config.setdefault("model", {})
+    model_config["attention_backend"] = resolve_attention_backend(model_config)
+    # Deprecated compatibility alias: keep this populated so older callers that
+    # inspect configs continue to work while new code uses attention_backend.
+    model_config["use_flash_attention"] = model_config["attention_backend"] == "flex"
+
     return config
 
 
@@ -541,7 +591,7 @@ def setup_training(config, device, scaler=None, resume_checkpoint_path=None):
             num_layers=config["model"]["num_layers"],
             dim_feedforward = config["model"]["dim_feedforward"],
             dropout=config["model"]["dropout"],
-            use_flash_attention=config["model"]["use_flash_attention"],
+            attention_backend=config["model"]["attention_backend"],
         )
     ).to(device)
 
@@ -909,6 +959,7 @@ def main(config_path, resume_checkpoint_path=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
+    logging.info("Attention backend: %s", config["model"]["attention_backend"])
 
     if not just_eval:
         early_stopper = training_utils.EarlyStopping(
@@ -1050,7 +1101,7 @@ def main(config_path, resume_checkpoint_path=None):
                 num_layers=config["model"]["num_layers"],
                 dim_feedforward = config["model"]["dim_feedforward"],
                 dropout=config["model"]["dropout"],
-                use_flash_attention=config["model"]["use_flash_attention"],
+                attention_backend=config["model"]["attention_backend"],
             )
         ).to(device)
         checkpoint = torch.load(config["model"]["checkpoint_path"])

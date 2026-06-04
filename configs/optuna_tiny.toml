@@ -5,7 +5,7 @@
 max_hits = 16
 
 [fixed.model]
-use_flash_attention = false
+attention_backend = "standard"
 
 [fixed.training]
 batch_size = 2
