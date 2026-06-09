@@ -98,3 +98,38 @@ def test_attention_backend_rejects_unknown_value():
 
     with pytest.raises(ConfigError, match="attention_backend"):
         validate_config(config)
+
+
+def test_batch_debug_logging_defaults_are_added_when_absent():
+    config = deepcopy(tiny_debug_config())
+    for key in (
+        "batch_log_interval",
+        "debug_first_batches",
+        "log_batch_shapes",
+        "log_grad_norm",
+    ):
+        config["logging"].pop(key, None)
+
+    validated = validate_config(config)
+
+    assert validated["logging"]["batch_log_interval"] == 0
+    assert validated["logging"]["debug_first_batches"] == 0
+    assert validated["logging"]["log_batch_shapes"] is False
+    assert validated["logging"]["log_grad_norm"] is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("batch_log_interval", -1, "[logging].batch_log_interval"),
+        ("debug_first_batches", -1, "[logging].debug_first_batches"),
+        ("log_batch_shapes", "yes", "[logging].log_batch_shapes"),
+        ("log_grad_norm", "yes", "[logging].log_grad_norm"),
+    ],
+)
+def test_batch_debug_logging_config_validation_rejects_invalid_values(key, value, message):
+    config = deepcopy(tiny_debug_config())
+    config["logging"][key] = value
+
+    with pytest.raises(ConfigError, match=re.escape(message)):
+        validate_config(config)

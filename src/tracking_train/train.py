@@ -10,6 +10,7 @@ import logging
 import wandb
 import argparse
 import copy
+import time
 from contextlib import nullcontext
 
 from tracking_train.models.cla_model import ClaModel, TransformerClassifier, generate_flex_padding_mask, generate_cluster_padding_mask, generate_sliding_window_padding_mask, token_pad_mask_from_seq_lengths, generate_distance_mask, generate_deltar_cone_mask
@@ -311,6 +312,17 @@ def validate_config(config):
     _require_nonempty_string(config, ("logging", "level"), errors)
     _require_positive_int(config, ("logging", "epoch_log_interval"), errors)
     _require_positive_int(config, ("logging", "model_save_interval"), errors)
+
+    logging_config = config.get("logging", {})
+    if "batch_log_interval" in logging_config:
+        _require_nonnegative_int(config, ("logging", "batch_log_interval"), errors)
+    if "debug_first_batches" in logging_config:
+        _require_nonnegative_int(config, ("logging", "debug_first_batches"), errors)
+    if "log_batch_shapes" in logging_config:
+        _require_bool(config, ("logging", "log_batch_shapes"), errors)
+    if "log_grad_norm" in logging_config:
+        _require_bool(config, ("logging", "log_grad_norm"), errors)
+
     _require_nonempty_string(config, ("output", "base_path"), errors)
     _require_bool(config, ("wandb", "enabled"), errors)
 
@@ -323,6 +335,12 @@ def validate_config(config):
     
     if errors:
         raise ConfigError("Invalid training config:\n- " + "\n- ".join(errors))
+
+    logging_config = config.setdefault("logging", {})
+    logging_config.setdefault("batch_log_interval", 0)
+    logging_config.setdefault("debug_first_batches", 0)
+    logging_config.setdefault("log_batch_shapes", False)
+    logging_config.setdefault("log_grad_norm", False)
 
     model_config = config.setdefault("model", {})
     model_config["attention_backend"] = resolve_attention_backend(model_config)
@@ -660,6 +678,90 @@ def setup_training(config, device, scaler=None, resume_checkpoint_path=None):
     )
 
 
+def _current_lr(optimizer):
+    """Return the first optimizer learning rate for concise batch logging."""
+    return optimizer.param_groups[0]["lr"] if optimizer.param_groups else float("nan")
+
+
+def _global_grad_norm(model):
+    """Compute the L2 norm across currently populated parameter gradients."""
+    norm_sq = 0.0
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        grad_norm = parameter.grad.detach().data.norm(2)
+        norm_sq += grad_norm.item() ** 2
+    return norm_sq ** 0.5
+
+
+def _tensor_shape(tensor):
+    """Return a tuple shape for tensors and a descriptive value otherwise."""
+    return tuple(tensor.shape) if hasattr(tensor, "shape") else None
+
+
+def _label_debug_summary(labels, pad_mask):
+    """Build label statistics for non-padded, non-negative labels."""
+    valid_label_mask = (~pad_mask) & (labels >= 0)
+    valid_labels = labels[valid_label_mask]
+    if valid_labels.numel() == 0:
+        return {
+            "valid_label_count": 0,
+            "unique_labels": [],
+            "min_label": None,
+            "max_label": None,
+        }
+
+    unique_labels = valid_labels.unique(sorted=True).detach().cpu().tolist()
+    return {
+        "valid_label_count": int(valid_labels.numel()),
+        "unique_labels": unique_labels,
+        "min_label": int(valid_labels.min().item()),
+        "max_label": int(valid_labels.max().item()),
+    }
+
+
+def _log_debug_batch_shapes(
+    *,
+    phase,
+    epoch,
+    batch_idx,
+    coords,
+    labels,
+    pos_enc,
+    seq_lengths,
+    pad_mask,
+    flex_padding_mask,
+    logits,
+    device,
+):
+    """Log detailed tensor and label diagnostics for early debug batches."""
+    label_summary = _label_debug_summary(labels, pad_mask)
+    parts = [
+        f"{phase} debug batch | epoch={epoch + 1}",
+        f"batch={batch_idx + 1}",
+        f"coords_shape={_tensor_shape(coords)}",
+        f"labels_shape={_tensor_shape(labels)}",
+        f"pos_enc_shape={_tensor_shape(pos_enc)}",
+        f"seq_lengths_shape={_tensor_shape(seq_lengths)}",
+        f"pad_mask_shape={_tensor_shape(pad_mask)}",
+        f"attention_mask_shape={_tensor_shape(flex_padding_mask)}",
+        f"logits_shape={_tensor_shape(logits)}",
+        f"valid_labels={label_summary['valid_label_count']}",
+        f"unique_labels={label_summary['unique_labels']}",
+        f"min_label={label_summary['min_label']}",
+        f"max_label={label_summary['max_label']}",
+        f"seq_lengths={seq_lengths.detach().cpu().tolist()}",
+    ]
+    if device.type == "cuda" and torch.cuda.is_available():
+        parts.extend(
+            [
+                f"cuda_memory_allocated_gb={torch.cuda.memory_allocated(device) / 1e9:.4f}",
+                f"cuda_memory_reserved_gb={torch.cuda.memory_reserved(device) / 1e9:.4f}",
+            ]
+        )
+    logging.info(" | ".join(parts))
+
+
 def train_epoch(
     model,
     trainloader,
@@ -677,8 +779,15 @@ def train_epoch(
     model.train()  # Set model to training mode
 
     running_tot = 0.
+    n_batches = len(trainloader)
+    logging_config = config["logging"]
+    batch_log_interval = logging_config.get("batch_log_interval", 0)
+    debug_first_batches = logging_config.get("debug_first_batches", 0)
+    log_batch_shapes = logging_config.get("log_batch_shapes", False)
+    log_grad_norm = logging_config.get("log_grad_norm", False)
 
     for i, (coords, _, labels, pos_enc, seq_lengths) in enumerate(trainloader):
+        batch_start_time = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         coords, labels, seq_lengths, pos_enc = coords.to(device), labels.to(device), seq_lengths.to(device), pos_enc.to(device)
 
@@ -696,6 +805,21 @@ def train_epoch(
 
             tot_loss = compute_losses(cla_criterion, logits, labels, pad_mask)
 
+        if log_batch_shapes and i < debug_first_batches:
+            _log_debug_batch_shapes(
+                phase="train",
+                epoch=epoch,
+                batch_idx=i,
+                coords=coords,
+                labels=labels,
+                pos_enc=pos_enc,
+                seq_lengths=seq_lengths,
+                pad_mask=pad_mask,
+                flex_padding_mask=flex_padding_mask,
+                logits=logits,
+                device=device,
+            )
+
         """    
         scaler.scale(tot_loss).backward()
 
@@ -705,8 +829,12 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
         """
+        grad_norm = None
         if scaler is not None and scaler.is_enabled():
             scaler.scale(tot_loss).backward()
+            if log_grad_norm:
+                scaler.unscale_(optimizer)
+                grad_norm = _global_grad_norm(model)
 
             if config["logging"]["level"] == "DEBUG":
                 wandb_logger.log_gradient_norm(model)
@@ -715,6 +843,8 @@ def train_epoch(
             scaler.update()
         else:
             tot_loss.backward()
+            if log_grad_norm:
+                grad_norm = _global_grad_norm(model)
 
             if config["logging"]["level"] == "DEBUG":
                 wandb_logger.log_gradient_norm(model)
@@ -729,9 +859,20 @@ def train_epoch(
         )
         
         
-        running_tot += tot_loss.item()      
+        running_tot += tot_loss.item()
 
-    n_batches   = len(trainloader)
+        if batch_log_interval > 0 and (i + 1) % batch_log_interval == 0:
+            batch_time = time.perf_counter() - batch_start_time
+            running_avg_loss = running_tot / (i + 1)
+            message = (
+                f"Train batch | epoch={epoch + 1} | batch={i + 1}/{n_batches} | "
+                f"loss={tot_loss.item():.4f} | running_loss={running_avg_loss:.4f} | "
+                f"lr={_current_lr(optimizer):.6g} | time_per_batch={batch_time:.4f}s"
+            )
+            if log_grad_norm and grad_norm is not None:
+                message += f" | grad_norm={grad_norm:.4f}"
+            logging.info(message)
+
     epoch_loss  = running_tot / n_batches
     epoch_accuracy   = metrics_calculator.calculate_accuracy()
 
@@ -771,9 +912,12 @@ def validate_epoch(
     model.eval()
 
     running_tot = 0.
+    n_batches = len(valloader)
+    batch_log_interval = config["logging"].get("batch_log_interval", 0)
 
     with torch.no_grad():
       for i, (coords, _, labels, pos_enc, seq_lengths) in enumerate(valloader):
+        batch_start_time = time.perf_counter()
         coords, labels, seq_lengths, pos_enc = coords.to(device), labels.to(device), seq_lengths.to(device), pos_enc.to(device)
 
         # flex_padding_mask = generate_flex_padding_mask(seq_lengths)
@@ -796,9 +940,17 @@ def validate_epoch(
             loss=tot_loss.item()
         )
         
-        running_tot += tot_loss.item()         
+        running_tot += tot_loss.item()
 
-    n_batches = len(valloader)
+        if batch_log_interval > 0 and (i + 1) % batch_log_interval == 0:
+            batch_time = time.perf_counter() - batch_start_time
+            running_avg_loss = running_tot / (i + 1)
+            logging.info(
+                f"Validation batch | epoch={epoch + 1} | batch={i + 1}/{n_batches} | "
+                f"loss={tot_loss.item():.4f} | running_loss={running_avg_loss:.4f} | "
+                f"time_per_batch={batch_time:.4f}s"
+            )
+
     epoch_loss = running_tot / n_batches
     epoch_accuracy = metrics_calculator.calculate_accuracy()
 
